@@ -86,26 +86,50 @@ So we dropped the attribute-tree approach. The lesson: **a scene-biased model ca
 
 ## 4. How we kept ourselves honest
 
-Before committing weeks of compute to "the next idea," we built a cheap feedback loop.
+Two feedback loops, running at different speeds.
+
+**Inner loop — caption quality, during prompt iteration.**
+
+DeepSeek-VL2 generated captions on a sample; Gemini, used as a stronger judge, graded those captions at scale. Each prompt variant was run on the sample, Gemini scored the outputs, and the failure modes it flagged drove the next prompt revision.
 
 ```
-Small subset of captions
-      ↓
-Short pretraining run
-      ↓
+Draft prompt
+   ↓
+DeepSeek-VL2 generates captions on sample
+   ↓
+Gemini (stronger judge) grades caption quality at scale
+   ↓
+Revise prompt based on what Gemini flagged
+   ↓  (repeat until captions looked consistently good)
+Lock in the prompt
+```
+
+Using a stronger LLM to judge the captioner's output lets us evaluate hundreds of captions per round instead of eyeballing twenty. This was the signal that actually drove the seven prompt rounds in §5. Important honest caveat: Gemini is still an opinion, not a ground truth — it can be consistently wrong in ways neither it nor we would catch. We'll come back to that in §10.
+
+**Outer loop — representation quality, after pretraining.**
+
+Once a prompt was locked in and captions were generated across the corpus, we ran pretraining. The validation signal was a zero-shot probe on a benchmark we'd never trained on:
+
+```
+Trained backbone
+   ↓
 Zero-shot ReID on Market1501 (public benchmark, no fine-tuning)
-      ↓
+   ↓
    Did Rank-1 move vs off-the-shelf CLIP?
-      ↓
-yes → caption quality is actually improving the embedding → scale up
-no  → don't scale; fix captions first
+   ↓
+yes → pretraining learned something identity-relevant → scale up, build downstream heads
+no  → rethink captions or pretraining recipe
 ```
 
-Market1501 is a public person ReID benchmark. We'd never trained on it — but we could use it as a cheap, honest probe of whether our pretraining had learned anything identity-relevant.
+Market1501 is a public person ReID benchmark. Running the image encoder on it with no fine-tuning and checking Rank-1 against off-the-shelf CLIP was a cheap, honest probe of whether pretraining was doing something real.
 
-This probe took minutes to run once the backbone was trained. Every caption iteration, every prompt tweak, every new VLM we evaluated — we ran this probe first.
+This was a **post-training check, not a per-iteration signal.** Running the probe required a full pretraining pass — too expensive to do per prompt tweak. That's why we needed the inner loop in the first place.
 
-It's the same discipline as "check PCA before training" in small-data projects: **verify the representation is doing something useful before you burn time on downstream heads.**
+**Why two loops, not one.**
+
+The inner loop gave fast caption-level feedback; the outer loop told us whether better-looking captions actually translated into a better *representation*. Either alone would have been worse — pretraining-only feedback is too slow to iterate prompts, caption-grading alone leaves you guessing whether good captions produce a good embedding.
+
+Same discipline as "check PCA before training" in small-data projects: **verify the representation is doing something useful before burning compute on downstream heads.**
 
 ---
 
@@ -250,6 +274,28 @@ Ranked by measured contribution, what actually moved the needle:
 4. **Backbone size.** In our regime, didn't matter nearly as much as 1–3.
 
 The lesson that stuck with us: **the bottleneck is rarely what the naive story says it is.** Caption alignment with the task was the bottleneck. Capacity, data volume, and training compute were all cheaper than they looked in hindsight, because they weren't the limiting factor.
+
+### What I'd do differently if I ran this again
+
+The inner feedback loop (§4) used DeepSeek-VL2 to generate captions and Gemini as a stronger judge to grade them at scale — meaningfully better than manual inspection, but still subjective. Gemini is a good opinion, not ground truth. If it's consistently wrong about a clothing colour, or reads "maroon" as "red", both captioner and judge can share that failure mode and we'd never notice.
+
+The piece that was missing: a **small labelled reference set** — a few hundred to ~2000 person crops with structured attribute labels (upper-wear type and colour from closed vocabularies, lower-wear, accessories, gender, age bucket, skin tone bucket, occlusion level). One-time cost of roughly a person-week.
+
+With that in hand, every candidate prompt can be scored objectively in minutes:
+
+- Generate captions for the reference set with the candidate prompt.
+- Auto-extract structured attributes from each caption using a small LLM with constrained JSON output.
+- Compare extracted attributes to ground truth → per-attribute precision, recall, and hallucination rate.
+
+Three things this would have unlocked that Gemini-as-judge alone couldn't:
+
+1. **Per-attribute attribution.** Round 4 becomes *"accessories recall jumped from 0.22 → 0.82"*, not *"the captions felt better."* Silent regressions in other attributes (e.g. a later round accidentally hurting gender recall) get caught instead of quietly polluting the training set.
+2. **Stable across time.** Static ground-truth labels don't drift when a judge model updates. Scores from a year ago remain comparable; captioner or VLM swaps become a 10-minute evaluation instead of a pretraining run.
+3. **Enables automated prompt search.** DSPy, OPRO, and APE need a stable, objective metric to optimise against. With this reference set, prompt iteration stops being a manual craft and becomes a search — the seven rounds compress to a handful of actually-informative decisions.
+
+None of this invalidates what we did. We shipped a backbone that beats off-the-shelf CLIP 3.5× zero-shot, and the Gemini-graded loop was a real feedback loop, not guesswork. But the seven rounds would have been three, the prompt decisions would have been defensible per-attribute rather than holistic, and a future team picking this up wouldn't have to reproduce the prompt-engineering history to trust the captions.
+
+**The underlying principle:** when building feedback loops for a representation-learning system, you want signal at every level you can afford to instrument. We had caption-level *subjective* (Gemini) and representation-level *objective* (Market1501 zero-shot). The missing rung was caption-level *objective* — cheap to build, would have made every downstream decision sharper.
 
 ---
 
