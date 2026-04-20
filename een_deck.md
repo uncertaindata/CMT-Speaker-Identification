@@ -68,15 +68,21 @@ That's what "person-centric foundation model" means in our context.
 
 ## 3. The first idea — and why it didn't work
 
-We had millions of person crops. We had no captions. Getting captions at that scale manually was not on the table.
+Our corpus was a mix of **public person-centric image datasets** — CC3M, Visual Genome, SBU, COCO, LUP — aggregated with **internal surveillance datasets**. Several million person crops in total. None of it had usable captions for a person-only task; existing captions in the public sets described the whole scene.
 
-The first idea was natural: **use CLIP itself to generate captions.** Build an attribute hierarchy — upper-wear × colour × texture × lower-wear × accessories × age × gender — enumerate templated captions like *"A photo of a person wearing a blue patterned t-shirt"*, pass each one through frozen CLIP, take the highest-similarity caption as the pseudo-label.
+Generating captions manually at this scale was not on the table. We needed to automate.
 
-Two things broke it.
+The first idea was natural: **use CLIP itself to generate captions.** The approach had three stages:
 
-**The combinatorics blew up.** Upper-wear alone had ~10³ possible captions. Adding lower-wear multiplied that. For each image we'd be running a thousand-plus similarity computations. At corpus scale, the compute was untenable.
+1. **Attribute phrase extraction** — break the description of a person into attribute phrases (upper-wear type / colour / texture / lower-wear / accessories / age / gender).
+2. **Match attribute phrases with CLIP** — assemble each combination into a templated caption like *"A photo of a person wearing a blue patterned t-shirt,"* run it through frozen CLIP, score cosine similarity against the image.
+3. **Sentence generation** — pick the highest-similarity caption per leaf node in the attribute tree; stitch the winners into a coherent sentence.
 
-**And more importantly — the captions it picked were wrong in a predictable way.** The colour predictions tracked the *background*, not the clothing. When we reviewed mispredictions one by one, the pattern was unambiguous: if the background had a dominant colour (wall, vehicle, sky), the caption's shirt colour was biased toward it.
+Two things broke this pipeline.
+
+**The combinatorics blew up.** Even for a single attribute group like upper-wear, enumerating the captions meant **14 clothing types × 13 colours × 6 textures = 1,092 caption variants per image**, each requiring a CLIP forward pass. Multiplied across lower-wear, accessories, and the other attribute groups, and then across several million images, the compute was untenable. Transformer-based CLIP inference is not cheap at that scale.
+
+**And more importantly — the captions it picked were wrong in a predictable way.** The colour predictions tracked the *background*, not the clothing. Concrete failure: on a crop of someone wearing a white hoodie standing against a purple wall, the best-matching caption came out as *"A person wearing a purple plain coloured hoodie."* When we reviewed mispredictions one by one, the pattern was unambiguous: if the background had a dominant colour (wall, vehicle, sky), the caption's shirt colour biased toward it.
 
 We'd just rediscovered the reason CLIP wasn't good for our task in the first place. Using CLIP to caption a person was like asking a friend who can't tell left from right for directions — the same blind spot was going to corrupt everything downstream.
 
@@ -84,18 +90,20 @@ So we dropped the attribute-tree approach. The lesson: **a scene-biased model ca
 
 ---
 
-## 4. How we kept ourselves honest
+## 4. Switching captioners and iterating the prompt
 
-Two feedback loops, running at different speeds.
+Vision–language models like **DeepSeek-VL** were designed for subject-level captioning, not image-level similarity. That was the right kind of tool for the job. We switched.
 
-**Inner loop — caption quality, during prompt iteration.**
+**Picking the right size mattered.** We evaluated the 7B variant (`deepseek-vl-7b-chat`) against the smaller 1.3B (`deepseek-vl-1.3b-chat`). The smaller model was faster and cheaper per image, but on complex prompts it struggled — captions became non-meaningful more often, and the failure rate on long attribute lists was noticeably higher. Since caption generation was already the rate-limiting step of the whole pipeline regardless of model size, paying the extra compute for the 7B model's reliability was the right trade.
 
-DeepSeek-VL2 generated captions on a sample; Gemini, used as a stronger judge, graded those captions at scale. Each prompt variant was run on the sample, Gemini scored the outputs, and the failure modes it flagged drove the next prompt revision.
+A better tool doesn't automatically produce better captions, though. The first prompt we fed the VLM was naive, and the captions it produced had their own failure modes — truncation past CLIP's token budget, hallucinated attributes, activity descriptions drowning out identity cues. We needed to iterate the prompt, and we needed caption-level feedback that didn't require running a full pretraining pass every time we tried a new version.
+
+So we built an inner loop using a stronger LLM as the judge:
 
 ```
 Draft prompt
    ↓
-DeepSeek-VL2 generates captions on sample
+DeepSeek-VL2 generates captions on a sample
    ↓
 Gemini (stronger judge) grades caption quality at scale
    ↓
@@ -104,11 +112,27 @@ Revise prompt based on what Gemini flagged
 Lock in the prompt
 ```
 
-Using a stronger LLM to judge the captioner's output lets us evaluate hundreds of captions per round instead of eyeballing twenty. This was the signal that actually drove the seven prompt rounds in §5. Important honest caveat: Gemini is still an opinion, not a ground truth — it can be consistently wrong in ways neither it nor we would catch. We'll come back to that in §10.
+Using Gemini to judge DeepSeek-VL2's output let us evaluate hundreds of captions per round instead of eyeballing twenty. Honest caveat: Gemini is still an opinion, not ground truth — it can be consistently wrong in ways neither it nor we would catch. We'll come back to that in §10.
 
-**Outer loop — representation quality, after pretraining.**
+Seven rounds, each driven by a specific class of failure the judge flagged:
 
-Once a prompt was locked in and captions were generated across the corpus, we ran pretraining. The validation signal was a zero-shot probe on a benchmark we'd never trained on:
+| Round | What we fixed | Why it mattered |
+|---|---|---|
+| 1 | Basic structured format (gender / clothes / activity) | Starting point; too generic, activity drowned out identity |
+| 2 | Moved activity out of the identity sentence | Activity is noisy and unhelpful for ReID |
+| 3 | Capped caption length | Long captions truncate in CLIP's 77-token budget |
+| 4 | Added accessories (bag, phone, cap, glasses, carried objects) | Accessories are strong identity cues — and, as it turned out, load-bearing for weapon detection later |
+| 5 | Added skin tone; capped to 3 sentences | Missing identity cue; length control |
+| 6 | "If not applicable, don't mention it" | VLM was hallucinating attributes that weren't in the image |
+| 7 | Final word cap + comprehensive attribute set | Fit CLIP's tokenizer budget without truncating identity info |
+
+The round-4 decision — asking the captioner to explicitly mention carried objects — looked like a simple thoroughness choice at the time. It turned out to matter for a downstream task we hadn't built yet. By the time we trained the backbone, the embedding space had already absorbed weapon-relevant semantics, for free, because thousands of captions described people carrying weapons. If there's one thing I'd point at as the "quiet decision that compounded," it's round 4.
+
+---
+
+## 5. Validating the backbone after pretraining
+
+The inner loop in §4 told us when captions *looked* good. But looking good isn't the same as producing a better *representation* — which is what we actually care about. For that we needed an outer loop, and we only got to run it once the backbone had been trained.
 
 ```
 Trained backbone
@@ -121,52 +145,38 @@ yes → pretraining learned something identity-relevant → scale up, build down
 no  → rethink captions or pretraining recipe
 ```
 
-Market1501 is a public person ReID benchmark. Running the image encoder on it with no fine-tuning and checking Rank-1 against off-the-shelf CLIP was a cheap, honest probe of whether pretraining was doing something real.
+Market1501 is a public person ReID benchmark. Running the image encoder on it with no fine-tuning and checking Rank-1 against off-the-shelf CLIP was a cheap, honest probe of whether pretraining had learned something identity-relevant.
 
-This was a **post-training check, not a per-iteration signal.** Running the probe required a full pretraining pass — too expensive to do per prompt tweak. That's why we needed the inner loop in the first place.
+This was a **post-training check, not a per-iteration signal.** Running the probe required a full pretraining pass — too expensive to do per prompt tweak. That's why the inner loop in §4 had to carry the fast iteration work.
 
-**Why two loops, not one.**
-
-The inner loop gave fast caption-level feedback; the outer loop told us whether better-looking captions actually translated into a better *representation*. Either alone would have been worse — pretraining-only feedback is too slow to iterate prompts, caption-grading alone leaves you guessing whether good captions produce a good embedding.
-
-Same discipline as "check PCA before training" in small-data projects: **verify the representation is doing something useful before burning compute on downstream heads.**
-
----
-
-## 5. Switching to a VLM captioner — and seven rounds of prompts
-
-Vision-language models like DeepSeek-VL were designed for subject-level captioning, not image-level similarity. That was the right kind of tool. We switched.
-
-The first prompt was naive. The captions it produced surfaced new failure modes. We iterated, one prompt round at a time, each round driven by a specific thing we saw going wrong:
-
-| Round | What we fixed | Why it mattered |
-|---|---|---|
-| 1 | Basic structured format (gender / clothes / activity) | Starting point; too generic, activity drowned out identity |
-| 2 | Moved activity out of the identity sentence | Activity is noisy and unhelpful for ReID |
-| 3 | Capped caption length | Long captions truncate in CLIP's 77-token budget |
-| 4 | Added accessories (bag, phone, cap, glasses, carried objects) | Accessories are strong identity cues — and, as it turned out, load-bearing for weapon detection later |
-| 5 | Added skin tone; capped to 3 sentences | Missing identity cue; length control |
-| 6 | "If not applicable, don't mention it" | VLM was hallucinating attributes that weren't in the image |
-| 7 | Final word cap + comprehensive attribute set | Fit CLIP's tokenizer budget without truncating identity info |
-
-The round-4 decision — asking the captioner to explicitly mention carried objects — looked like a simple thoroughness choice at the time. It turned out to matter for a downstream task we hadn't built yet. By the time we trained the backbone, the embedding space had already absorbed weapon-relevant semantics, for free, because thousands of the captions described people carrying weapons.
-
-If there's one thing I'd point at as the "quiet decision that compounded," it's round 4.
+**Why two loops, not one.** The inner loop gave fast caption-level feedback; the outer loop told us whether better-looking captions actually translated into a better representation. Either alone would have been worse — pretraining-only feedback is too slow to iterate prompts; caption-grading alone leaves you guessing whether good captions produce a good embedding. Same discipline as "check PCA before training" in small-data projects: **verify the representation is doing something useful before burning compute on downstream heads.**
 
 ---
 
 ## 6. Training the backbone
 
-Once the captions were good, the training recipe was fairly standard:
+Once the captions were good, the training recipe itself was fairly standard — but the data pipeline before training did real work.
+
+### Data pipeline — from raw captions to training pairs
+
+| Stage | What we filtered / added | Pairs |
+|---|---|---|
+| Raw image–caption pairs after the VLM pass | (all successfully captioned crops) | ~1.3M |
+| Filter blurry / low-information crops | images where identity cues weren't extractable | ~950K |
+| Filter verbose / untokenisable captions | captions exceeding CLIP's 77-token budget | ~800K |
+| Sentence chunking augmentation | split long captions into 2–3-sentence fragments | ~1.4M effective pairs |
+
+Why the augmentation step matters: the VLM produced long, information-dense captions — one image, one ~200-token caption. Directly tokenising them lost everything past CLIP's 77-token limit, and the pre-filter threw away captions that didn't fit. Instead of discarding, we broke each long caption into 2–3-sentence fragments and treated each fragment as a separate text positive for the same image. Different fragments emphasised different attributes — clothing in one, accessories in another, build and posture in a third. The same image mapped to several valid captions; the embedding learned that all of them described the same identity. Acted as regularisation, and recovered most of the pairs lost to the length filter.
+
+### Training configuration
 
 - **Architecture:** CLIP-style contrastive, ViT-B/16 vision tower, standard text transformer.
 - **Loss:** InfoNCE contrastive.
-- **Optimiser / schedule:** AdamW, AMP mixed precision, cosine LR with warmup.
-- **Initialisation:** off-the-shelf CLIP weights. No reason to throw away a good starting point.
-
-The one non-obvious choice: **caption augmentation via sentence chunking.** The VLM produced long, information-dense captions. Tokenising them directly lost information past CLIP's 77-token limit. Instead, we broke each long caption into 2–3-sentence fragments and treated each fragment as a separate text positive for the same image. Different fragments emphasised different attributes — one focused on clothing, another on accessories, another on build and posture.
-
-The net effect: the same image mapped to several valid captions; the embedding learned that all of them described the same identity. It acted as a form of regularisation, and it nearly doubled the effective training pairs.
+- **Initialisation:** off-the-shelf CLIP weights (no reason to throw away a strong starting point).
+- **Optimiser:** AdamW with β1 = 0.9, β2 = 0.98, ε = 1e-6, weight decay 0.1.
+- **Schedule:** cosine LR, base 1e-6, 2000-step warmup.
+- **Batch size:** 196, AMP mixed precision, 32 epochs.
+- **Split:** 80 / 10 / 10 train / validation / test.
 
 ---
 
@@ -199,10 +209,10 @@ Once the backbone was good, a second story started playing out, mostly unplanned
                          │    (frozen)         │
                          └──────┬──────────────┘
                                 │
-            ┌───────────┬───────┼────────┬───────────┐
-            ▼           ▼       ▼        ▼           ▼
-         ReID     Attributes  Action   NL video    Weapon
-                                      search      detection
+         ┌───────────┬──────────┼──────────────┬───────────┐
+         ▼           ▼          ▼              ▼           ▼
+       ReID     Attributes   Action    Natural-language   Weapon
+                                        video search     detection
 ```
 
 Each new product was a thin head on the frozen backbone:
@@ -211,7 +221,7 @@ Each new product was a thin head on the frozen backbone:
 |---|---|---|
 | Person ReID | cosine similarity over embeddings | retrieve same identity across cameras |
 | Person attributes (colour, etc.) | small FC layers | classify clothing colour, other attributes |
-| NL video search | dual index (person + scene) | retrieve frames by natural-language query |
+| Natural-language video search | dual index (person + scene) | retrieve frames by natural-language query |
 | Action / person-attribute | second-stage contrastive pretraining | extend embedding to encode actions |
 | Weapon detection | classifier + temporal transformer | detect weapons in person crops |
 
@@ -395,8 +405,8 @@ Different scales, same instincts: **measure what the representation is actually 
 | 2 | Where we started (§1) | web vs surveillance comparison |
 | 3 | Why generic CLIP fell short (§2) | attention-bleed illustration |
 | 4 | First idea that failed (§3) | attribute tree + wrong-colour example |
-| 5 | The feedback loop we built (§4) | probe flowchart |
-| 6 | VLM captioner + 7 prompt rounds (§5) | 7-round table |
+| 5 | Switching captioner + inner loop + 7 rounds (§4) | inner-loop diagram + 7-round table |
+| 6 | Validating after pretraining (§5) | outer-loop / Market1501 probe flowchart |
 | 7 | Training the backbone (§6) | pretraining pipeline diagram |
 | 8 | First real signal (§7) | Market1501 Rank-1 bar chart |
 | 9 | One model, five products (§8) | hub-and-spoke |
@@ -410,8 +420,10 @@ Different scales, same instincts: **measure what the representation is actually 
 
 ## What's held back from this version (external-safe)
 
-- Internal dataset names, per-source counts, aggregate corpus size
-- Training throughput, GPU memory specifics, time-to-train
-- Verbatim VLM prompts (the 7-round table shows *what* each round fixed, not the prompt strings)
-- Weapon-detection distance/lighting/IR performance numbers and field-test methodology specifics
-- Internal model code-names, colleagues' names, Jira IDs, runbook and monitoring URLs
+- **Internal dataset specifics** — specific internal dataset names, per-source crop counts, and the aggregate source-corpus size. (Public source names and the downstream *filtered training-pair counts* are shown, since those describe our pipeline ratios rather than raw corpus scale.)
+- **Caption-generation throughput** — exact GPU memory, time-to-caption-corpus, per-second throughput numbers.
+- **Verbatim VLM prompts** — the 7-round table shows *what* each round fixed, not the prompt strings.
+- **Weapon-detection field metrics** — distance / lighting / IR performance numbers and field-test methodology specifics.
+- **Internal identifiers** — internal model code-names, colleagues' names, Jira IDs, runbook and monitoring URLs.
+
+If the audience for this deck is fully internal to EEN, the first two bullets can be relaxed — tell me and I'll add the source-per-dataset counts, aggregate corpus size, and caption-generation time numbers from the Confluence source page.
