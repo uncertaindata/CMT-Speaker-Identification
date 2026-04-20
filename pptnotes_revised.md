@@ -1,32 +1,3 @@
-# Interview PPT — Highlighter Notes (revised)
-
-> **Note on metrics used throughout:** CMT holds the test-set labels, so we cannot directly measure test-set accuracy. **All per-speaker accuracy numbers below are from 5-fold cross-validation on the training set**, not test-set performance. The one test-set number we have — **81.1% model-to-model agreement** (section 11) — compares predictions from two models on the test set and does *not* require ground truth. Use the right framing in the interview: "CV-estimated" for per-speaker accuracies, "model agreement" for the 81.1%.
-
----
-
-## Narrative flow
-
-The sections below follow a deliberate arc:
-
-```
-  Problem framing
-        ↓
-  What the data is
-        ↓
-  Approach 1: features   →   PCA sanity check   →   Approach 2: MOIRAI
-        ↓
-  Classifier choice (common to both)
-        ↓
-  Results
-        ↓
-  Visual + numerical analysis (PCA, confusion matrices)
-        ↓
-  Interpretation (class size vs acoustic similarity)
-        ↓
-  What I'd improve
-```
-
----
 
 ## 1. The graded metric is worst-speaker accuracy, not mean
 
