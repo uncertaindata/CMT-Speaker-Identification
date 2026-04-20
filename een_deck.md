@@ -35,7 +35,7 @@
 
 Person re-identification — matching the same individual across cameras — is a core surveillance capability. It drives alert routing, investigation workflows, and cross-camera search. For us it was an obvious place to invest.
 
-Off-the-shelf models weren't delivering on our footage. Before reaching for bigger models, we wanted to understand *why* a 400M-parameter image-text model couldn't do well on what looks like a pretty basic retrieval task.
+Off-the-shelf models weren't delivering on our footage. Before reaching for bigger models, we wanted to understand *why* an image–text model trained on 400M web image–caption pairs couldn't do well on what looks like a pretty basic retrieval task.
 
 The mental model we converged on: **CLIP was trained on magazine covers; our cameras look at parking lots.** Those are two different distributions, and the gap isn't something fine-tuning can cleanly close.
 
