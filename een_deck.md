@@ -68,9 +68,11 @@ That's what "person-centric foundation model" means in our context.
 
 ## 3. The first idea — and why it didn't work
 
-Our corpus was a mix of **public person-centric image datasets** — CC3M, Visual Genome, SBU, COCO, LUP — aggregated with **internal surveillance datasets**. Several million person crops in total. None of it had usable captions for a person-only task; existing captions in the public sets described the whole scene.
+Our source was a mix of **public image datasets** — CC3M, Visual Genome, SBU, COCO, LUP — plus our own **internal surveillance footage**. But we didn't want full-frame images as the input to captioning — we wanted just the person, so the model would describe the person and not the scene around them.
 
-Generating captions manually at this scale was not on the table. We needed to automate.
+So we ran an **in-house person detector** over the source images and extracted tight person crops. Those crops — several million in total, covering both the public and the internal footage — became the actual input to the caption-generation pipeline. Where a source dataset already came as crops (e.g. LUP), we used them as-is; everywhere else we ran detection and cropped.
+
+None of the crops had captions usable for our task. The public datasets had whole-scene captions describing everything in the original image, not the person inside it. Our surveillance footage had no captions at all. Generating captions manually at this scale was not on the table, so we needed to automate.
 
 The first idea was natural: **use CLIP itself to generate captions.** The approach had three stages:
 
