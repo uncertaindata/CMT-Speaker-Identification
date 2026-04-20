@@ -339,6 +339,28 @@ The classifier is explicitly designed as a **high-recall, reasonable-precision f
 
 Field validation runs across varied deployment conditions — distances, lighting regimes, motion patterns — with continuous production performance monitoring. Specifics of the performance envelope are internal.
 
+### Foundation-model gains across the product family
+
+The foundation-model approach paid off across the product surface, not just on gun detection. Measured on **internal surveillance data** (not public benchmarks), every product that moved from its **pre-foundation baseline** to a **foundation-based head** improved — though the specific transition differed by product:
+
+![Foundation-model gains across the product family](backbone_change_gains.png)
+
+| Product | Pre-foundation baseline | Foundation-based (current) |
+|---|---|---|
+| Person ReID (surveillance eval) | 52% (standalone model) | **57%** — B/16 person foundation (+5 pp) |
+| Attribute colour (upper + lower wear) | 72% (standalone model) | **92%** — B/16 person foundation (+20 pp) |
+| Natural-language text search (R@1 / R@5) | — (capability didn't exist) | **73% / 94%** — B/16 person foundation |
+| Gun static classifier | 64% (B/16 person foundation) | **97%+** — L/14 action-person foundation (+33 pp) |
+
+Two distinct transitions, one conclusion:
+
+- For **ReID, attribute colour, and NL text search**, the pre-foundation baseline was a task-specific standalone model. Moving those heads onto the **B/16 person foundation** lifted each one — and for NL search, it made the capability exist at all.
+- For **gun detection**, the B/16 person foundation itself was the pre-upgrade baseline, and it wasn't sufficient. The **L/14 action-person foundation** (§9 above) was the upgrade that got it to deployable accuracy.
+
+Different transitions, same pattern: **picking the right foundation for the task beats building standalone models per product.** Foundation-model investment is a strategy that repeats, not a one-off win.
+
+**This is what motivated the next foundation: a vehicle model.** If foundation-model investments lifted every person-side product, we could run the same playbook on vehicles — make-and-model, vehicle colour, natural-language vehicle search — and expect the same compounding. See §11.
+
 ---
 
 ## 10. What we thought would matter vs. what actually did
@@ -382,8 +404,11 @@ None of this invalidates what we did. We shipped a backbone that beats off-the-s
 
 ### What we've committed to
 
+**A vehicle foundation model.**
+Direct extension of the person-foundation playbook to the vehicle domain. Same contrastive pretraining recipe, same VLM-captioner-with-iterated-prompt approach, same inner-loop / outer-loop validation discipline. The vehicle foundation will be the shared backbone for vehicle **make-and-model recognition**, **vehicle colour**, and **natural-language vehicle search** — all products currently running on off-the-shelf backbones that suffer the same scene-dominant issues we first saw on persons (§2). If the gains look anything like the person-side cross-product table in §9, the ROI is already argued: one pretraining investment, three products lifted.
+
 **Hard-negative contrastive.**
-Current pretraining uses generic contrastive loss. Hard-negative mining — pairs of visually similar but different-identity crops — would sharpen the embedding in the confusable-identity region, similar in spirit to metric learning in face recognition. This is the one direction I know we're taking up next.
+Current pretraining uses generic contrastive loss. Hard-negative mining — pairs of visually similar but different-identity crops — would sharpen the embedding in the confusable-identity region, similar in spirit to metric learning in face recognition.
 
 ### Other directions I'd explore
 
@@ -414,7 +439,7 @@ If the attributes head says "red shirt" and the ReID head says "same person as X
 | Downstream products shipped | N/A | 5 (ReID, attrs, action, NL search, weapon detection) |
 | Per-product training cost | standalone model | lightweight head on a pretrained foundation |
 | Weapon semantics in embedding | none | pre-seeded via captions (round 4) |
-| Gun-detection accuracy on B/16 vs L/14 foundation | — | ~64% → ~97%+ |
+| Foundation-model gains on internal surveillance (per product) | — | ReID 52 (standalone) → 57 (B/16); Colour 72 (standalone) → 92 (B/16); NL search — → R@1 73 / R@5 94 (B/16); Gun 64 (B/16) → 97+ (L/14 action-person) |
 
 If there are three things to take away:
 
@@ -489,10 +514,11 @@ Different scales, same instincts: **measure what the representation is actually 
 | 11 | Static classifier — architecture + training/dataset strategies (§9) | ViT-L/14 + FC head + freezing-depth sweep |
 | 12 | Benchmark vs Gemini and DeepSeek-VL2 (§9) | F1 / recall bar chart |
 | 13 | Temporal extension, driven by observed failures (§9) | failure-mode examples + temporal transformer diagram |
-| 14 | What actually moved the needle (§10) | ranked-factors table |
-| 15 | Where we go next (§11) | hard-negative committed + other directions |
-| 16 | Short version (§12) | comparison table + 3 takeaways |
-| 17 | Backup | — |
+| 14 | Foundation-model gains across the product family + vehicle-foundation motivation (§9) | 5-product "pre-foundation vs foundation-based" bar chart on internal surveillance |
+| 15 | What actually moved the needle (§10) | ranked-factors table |
+| 16 | Where we go next (§11) | vehicle foundation + hard-negative (committed) + other directions |
+| 17 | Short version (§12) | comparison table + 3 takeaways |
+| 18 | Backup | — |
 
 ---
 
