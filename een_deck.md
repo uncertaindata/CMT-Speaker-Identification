@@ -223,7 +223,7 @@ Each new product was a thin head on the frozen backbone:
 | Person attributes (colour, etc.) | small FC layers | classify clothing colour, other attributes |
 | Natural-language video search | dual index (person + scene) | retrieve frames by natural-language query |
 | Action / person-attribute | second-stage contrastive pretraining | extend embedding to encode actions |
-| Weapon detection | classifier + temporal transformer | detect weapons in person crops |
+| Weapon detection | ViT-L/14 + adapters (static), then a temporal transformer on top | detect weapons in person crops; beats Gemini / DeepSeek-VL2 on F1 |
 
 The economics changed meaningfully. A new attribute head went from a multi-week dataset-plus-training project to a few days of fitting FC layers on top of a frozen embedding. A new retrieval product went from running a fresh contrastive pretraining to just indexing the existing embedding.
 
@@ -235,11 +235,52 @@ This is what foundation models are *supposed* to do for a product surface. The s
 
 ReID and attributes covered the *who* and the *what they look like*. For safety-critical products we needed the *what they're doing*.
 
-So we did a **second pretraining stage** — starting from the person backbone, adding action and interaction supervision on top. Same contrastive objective, captions extended with activity and object-interaction descriptions. The result is the backbone that weapon detection sits on.
+So we did a **second pretraining stage** — starting from the person backbone, adding action and interaction supervision on top. Same contrastive objective, captions extended with activity and object-interaction descriptions. The result is the action-person backbone that weapon detection sits on.
 
-Weapon detection is where the whole stack proves itself. It's the highest-stakes downstream: false positives burn operator trust, missed detections cost safety. If the foundation-model approach was going to earn its keep on a product that matters, this was the test.
+Weapon detection is where the whole stack had to prove itself. It's the highest-stakes downstream: false positives burn operator trust, missed detections cost safety. If the foundation-model approach was going to earn its keep on a product that matters, this was the test.
 
-**Architecture:**
+### Step 1 — a static, single-frame weapon classifier
+
+Before we added any temporal reasoning, we built the minimum viable version: a **single-frame** classifier on top of the action-person embedding. The logic was simple — if a thin head on the foundation backbone couldn't beat strong VLM baselines on individual frames, temporal wasn't going to save us.
+
+**Architecture.** A **ViT-L/14** vision encoder derived from the action-person foundation, with **adapter layers** inserted for parameter-efficient fine-tuning on the weapon-detection task. The main backbone stayed frozen; adapters and the classification head carried the task-specific capacity. Standard "small-tunable-capacity, large-frozen-backbone" pattern — consistent with the foundation-model reuse principle (§B3).
+
+**Training strategies that actually moved the needle:**
+- **Freezing schedule experiments.** Started with everything frozen except adapters and head. When adapter-only capacity bottlenecked, selectively unfroze the last few transformer blocks.
+- **Architecture experiments.** Adapter placement (every layer vs every other vs last-K blocks), bottleneck dimensions, head depth, with and without residual connections.
+- **Hyperparameter tuning.** Learning rate, adapter bottleneck size, regularisation strength, batch composition.
+
+**Dataset strategies that mattered just as much:**
+- **Mixing ratios.** Weapon-positive crops are rare relative to negatives; naive training collapsed to "no weapon." Deliberate positive-to-negative ratios and loss weighting fixed that.
+- **Stratified train/val splits** by camera, lighting, and weapon type — so the validation set reflected deployment conditions rather than an IID slice of the training distribution.
+- **Domain-shift analysis.** Tracked validation metrics on separate slices (day vs night, close vs far, different weapon types). Caught slice-level regressions that global metrics would have hidden.
+- **Hard example mining.** Once the model was reasonable, cycled high-loss validation examples back into training and iterated.
+
+### Benchmarking against general-purpose VLMs
+
+Before committing to the custom stack, we compared it against the strongest off-the-shelf alternatives on the same secondary-validator task:
+- **Gemini** in two configurations — sequence-based (one call over a sequence of frames) and multi-vote (separate calls, majority).
+- **DeepSeek-VL2 Tiny** — a compact multimodal VLM.
+- **Ours** — action-person foundation + ViT-L/14 + adapters.
+
+Evaluation ran on a held-out set covering both static crops and motion-extended crops (to capture motion context).
+
+**Headline result.** Our model had the **best F1 and the highest recall** of any approach tested. Gemini led on precision — it only said "weapon" when highly confident — but its recall lagged, which matters for a safety-critical detector where missed weapons are the dangerous failure mode. DeepSeek-VL2 sat between the two.
+
+**F1 ordering:**
+
+```
+   Ours   >   Gemini (voting)   >   DeepSeek-VL2 Tiny   >   Gemini (sequence)
+```
+
+The interpretation worth stating plainly:
+- General-purpose VLMs are genuinely strong. DeepSeek-VL2 and Gemini both hit F1 in the mid-to-high 90s zero-shot. That's not a trivial baseline.
+- On a narrow, high-stakes domain task, a **small custom head on the right foundation backbone** beats them — because the foundation already encodes the relevant semantics and the adapter just has to learn the decision boundary, not re-learn the visual concept.
+- This is the foundation-model investment paying off concretely: **beating frontier VLMs with a compact model trained on a domain-specific embedding.**
+
+### Step 2 — adding temporal reasoning
+
+Once the static model was strong, we added a temporal layer to resolve single-frame ambiguity. A phone, a tool, and a pistol can look similar at one angle and one moment. Persistence across frames disambiguates — if an object holds its shape relative to the hand across multiple frames, the signal is real; if it flickers in one frame and disappears, it probably isn't.
 
 ```
   Frame t-2       Frame t-1         Frame t
@@ -248,7 +289,7 @@ Weapon detection is where the whole stack proves itself. It's the highest-stakes
   │  Frozen action-person embedding        │
   └──────┬───────────┬──────────┬──────────┘
          ↓           ↓          ↓
-       e(t-2)      e(t-1)      e(t)          (384-dim per frame)
+       e(t-2)      e(t-1)      e(t)          (per-frame embedding)
          │           │          │
          └───────────┼──────────┘
                      ▼
@@ -262,13 +303,15 @@ Weapon detection is where the whole stack proves itself. It's the highest-stakes
                └───────────┘
 ```
 
-**Why a thin classifier head works:** because of round 4. The pretraining captions already mentioned carried objects, including weapons. The embedding wasn't a blank slate — it had weapon-relevant semantics from the pretraining corpus. The supervised head just has to learn the decision boundary, not the visual concept.
+The temporal transformer operates on sequences of per-frame embeddings from the static model. Small — 2 layers — because the heavy visual work is already done by the frozen backbone; the temporal head just needs to learn "does this signal persist."
 
-**Why the temporal layer:** a single frame is ambiguous. A phone, a tool, and a pistol can look similar at one angle and one moment. Persistence across frames resolves that — if the object is consistently there, holding the same shape relative to the hand, for multiple frames, the signal is real. If it flickers in one frame and disappears, it's probably not.
+**Why a thin head still works:** because of round 4 (§4). The pretraining captions already mentioned carried objects, including weapons, so the embedding wasn't a blank slate — it had weapon-relevant semantics baked in from the pretraining corpus. The supervised head learns the decision boundary, not the visual concept.
 
-**Deployment shape:** human-in-the-loop. The classifier surfaces candidates; operators confirm. The model is designed to be a high-recall, reasonable-precision filter on a firehose, not an autonomous alarm. This shapes how we think about thresholds and drift.
+### Deployment
 
-Field validation happens across varied deployment conditions — distances, lighting regimes, motion patterns — with continuous production monitoring. Specifics of the performance envelope are internal.
+**Human-in-the-loop.** The classifier surfaces candidates; operators confirm. The model is designed to be a high-recall, reasonable-precision filter on a firehose, not an autonomous alarm. This shapes how we set thresholds and monitor drift.
+
+Field validation runs across varied deployment conditions — distances, lighting regimes, motion patterns — with continuous production performance monitoring. Specifics of the performance envelope are internal.
 
 ---
 
@@ -410,11 +453,13 @@ Different scales, same instincts: **measure what the representation is actually 
 | 7 | Training the backbone (§6) | pretraining pipeline diagram |
 | 8 | First real signal (§7) | Market1501 Rank-1 bar chart |
 | 9 | One model, five products (§8) | hub-and-spoke |
-| 10 | Action extension + weapon detection (§9) | temporal transformer diagram |
-| 11 | What actually moved the needle (§10) | ranked-factors table |
-| 12 | Where we go next (§11) | effort-vs-impact quadrant |
-| 13 | Short version (§12) | comparison table + 3 lines |
-| 14 | Backup | — |
+| 10 | Action extension + static gun classifier (§9, step 1) | ViT-L/14 + adapter architecture |
+| 11 | Benchmark vs Gemini and DeepSeek-VL2 (§9) | F1 ordering bar chart |
+| 12 | Temporal gun model + deployment (§9, step 2) | temporal transformer diagram |
+| 13 | What actually moved the needle (§10) | ranked-factors table |
+| 14 | Where we go next (§11) | effort-vs-impact quadrant |
+| 15 | Short version (§12) | comparison table + 3 lines |
+| 16 | Backup | — |
 
 ---
 
@@ -423,7 +468,9 @@ Different scales, same instincts: **measure what the representation is actually 
 - **Internal dataset specifics** — specific internal dataset names, per-source crop counts, and the aggregate source-corpus size. (Public source names and the downstream *filtered training-pair counts* are shown, since those describe our pipeline ratios rather than raw corpus scale.)
 - **Caption-generation throughput** — exact GPU memory, time-to-caption-corpus, per-second throughput numbers.
 - **Verbatim VLM prompts** — the 7-round table shows *what* each round fixed, not the prompt strings.
+- **Weapon-detector benchmark numbers** — exact TP / FP / TN / FN counts, absolute Precision / Recall / F1 values, evaluation-set composition, and the specific crop-sampling methodology (the F1 *ordering* vs Gemini and DeepSeek-VL2 is shown; absolute numbers are held back).
 - **Weapon-detection field metrics** — distance / lighting / IR performance numbers and field-test methodology specifics.
+- **Deployment specifics** — inference serving infra, sampling configurations, threshold and drift-monitoring parameters.
 - **Internal identifiers** — internal model code-names, colleagues' names, Jira IDs, runbook and monitoring URLs.
 
 If the audience for this deck is fully internal to EEN, the first two bullets can be relaxed — tell me and I'll add the source-per-dataset counts, aggregate corpus size, and caption-generation time numbers from the Confluence source page.
