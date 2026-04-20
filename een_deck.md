@@ -1,35 +1,3 @@
-# Person Foundation Model — how it came together
-
-> **Note on this deck**
-> This is a walkthrough of how the person-centric foundation model we built actually came together — the starting problem, the dead ends, the pivots, what ended up mattering, and where weapon detection fits into the story.
->
-> It's told in the order things happened, not as a post-hoc defence of every decision. Some choices seemed right at the time and turned out great; some looked right and weren't; some felt like detours and became load-bearing.
->
-> External-safe framing: specific internal dataset counts, infrastructure specs, verbatim prompts, and weapon-detection field numbers are held back. Benchmark numbers shown are on public datasets (Market1501).
-
----
-
-## How the story flows
-
-```
-  Person ReID wasn't working well enough on our footage
-        ↓
-  We figured out why — it was a distribution/caption problem, not capacity
-        ↓
-  First idea (CLIP-as-captioner) failed for a structural reason
-        ↓
-  Second idea (VLM captioner + prompt iteration) worked
-        ↓
-  The zero-shot probe told us pretraining was learning something real
-        ↓
-  Once the backbone was good, the downstream family emerged on its own
-        ↓
-  Action-person extension opened the door to weapon detection
-        ↓
-  Looking back: caption quality, not model size, is what actually drove results
-```
-
----
 
 ## 1. Where we started
 
@@ -494,42 +462,3 @@ A connecting thread: in both this foundation-model work and a recent small-data 
 | Real bottleneck | acoustic similarity, not class size | caption quality, not model size |
 
 Different scales, same instincts: **measure what the representation is actually doing before trusting the scale of the model to solve the problem.**
-
----
-
-## Slide order
-
-| # | Slide | Visual |
-|---|---|---|
-| 1 | Title | — |
-| 2 | Where we started (§1) | web vs surveillance comparison |
-| 3 | Why generic CLIP fell short (§2) | attention-bleed illustration |
-| 4 | First idea that failed (§3) | attribute tree + wrong-colour example |
-| 5 | Switching captioner + inner loop + 7 rounds (§4) | inner-loop diagram + 7-round table |
-| 6 | Validating after pretraining (§5) | outer-loop / Market1501 probe flowchart |
-| 7 | Training the backbone (§6) | pretraining pipeline diagram |
-| 8 | First real signal (§7) | Market1501 Rank-1 bar chart |
-| 9 | One model, five products (§8) | hub-and-spoke |
-| 10 | Gun-detection pipeline + why B/16 wasn't enough (§9) | 3-stage cascade diagram + B/16 vs L/14 accuracy bar |
-| 11 | Static classifier — architecture + training/dataset strategies (§9) | ViT-L/14 + FC head + freezing-depth sweep |
-| 12 | Benchmark vs Gemini and DeepSeek-VL2 (§9) | F1 / recall bar chart |
-| 13 | Temporal extension, driven by observed failures (§9) | failure-mode examples + temporal transformer diagram |
-| 14 | Foundation-model gains across the product family + vehicle-foundation motivation (§9) | 5-product "pre-foundation vs foundation-based" bar chart on internal surveillance |
-| 15 | What actually moved the needle (§10) | ranked-factors table |
-| 16 | Where we go next (§11) | vehicle foundation + hard-negative (committed) + other directions |
-| 17 | Short version (§12) | comparison table + 3 takeaways |
-| 18 | Backup | — |
-
----
-
-## What's held back from this version (external-safe)
-
-- **Internal dataset specifics** — specific internal dataset names, per-source crop counts, and the aggregate source-corpus size. (Public source names and the downstream *filtered training-pair counts* are shown, since those describe our pipeline ratios rather than raw corpus scale.)
-- **Caption-generation throughput** — exact GPU memory, time-to-caption-corpus, per-second throughput numbers.
-- **Verbatim VLM prompts** — the 7-round table shows *what* each round fixed, not the prompt strings.
-- **Weapon-detector benchmark numbers** — exact TP / FP / TN / FN counts, absolute Precision / Recall / F1 values, evaluation-set composition, and the specific crop-sampling methodology (the F1 *ordering* vs Gemini and DeepSeek-VL2 is shown; absolute numbers are held back).
-- **Weapon-detection field metrics** — distance / lighting / IR performance numbers and field-test methodology specifics.
-- **Deployment specifics** — inference serving infra, sampling configurations, threshold and drift-monitoring parameters.
-- **Internal identifiers** — internal model code-names, colleagues' names, Jira IDs, runbook and monitoring URLs.
-
-If the audience for this deck is fully internal to the team that built it, the first two bullets can be relaxed — the source-per-dataset counts, aggregate corpus size, and caption-generation throughput numbers from the internal source docs can be added in that case.
