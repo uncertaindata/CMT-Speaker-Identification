@@ -1,7 +1,7 @@
-# EEN Person Foundation Model — how it came together
+# Person Foundation Model — how it came together
 
 > **Note on this deck**
-> This is a walkthrough of how the person-centric foundation model developed at EEN actually came together — the starting problem, the dead ends, the pivots, what ended up mattering, and where weapon detection fits into the story.
+> This is a walkthrough of how the person-centric foundation model we built actually came together — the starting problem, the dead ends, the pivots, what ended up mattering, and where weapon detection fits into the story.
 >
 > It's told in the order things happened, not as a post-hoc defence of every decision. Some choices seemed right at the time and turned out great; some looked right and weren't; some felt like detours and became load-bearing.
 >
@@ -54,7 +54,7 @@ Once we laid the two distributions side by side, the problem wasn't "is CLIP big
 
 ## 2. Why generic CLIP kept falling short
 
-When we probed what CLIP was actually doing on our crops, a consistent pattern showed up: **its representations were scene-dominant, not person-dominant.**
+Qualitatively — running CLIP on person crops, reading its attribute predictions, and comparing them against what we could see by eye — a consistent pattern showed up: **its representations were scene-dominant, not person-dominant.**
 
 Concretely — if we asked it to tell us what colour shirt someone was wearing, it often gave us the colour of the wall behind them. Same for vehicles: tell me about the car, get a description biased by the street colour.
 
@@ -82,7 +82,7 @@ Two things broke this pipeline.
 
 **The combinatorics blew up.** Even for a single attribute group like upper-wear, enumerating the captions meant **14 clothing types × 13 colours × 6 textures = 1,092 caption variants per image**, each requiring a CLIP forward pass. Multiplied across lower-wear, accessories, and the other attribute groups, and then across several million images, the compute was untenable. Transformer-based CLIP inference is not cheap at that scale.
 
-**And more importantly — the captions it picked were wrong in a predictable way.** The colour predictions tracked the *background*, not the clothing. Concrete failure: on a crop of someone wearing a white hoodie standing against a purple wall, the best-matching caption came out as *"A person wearing a purple plain coloured hoodie."* When we reviewed mispredictions one by one, the pattern was unambiguous: if the background had a dominant colour (wall, vehicle, sky), the caption's shirt colour biased toward it.
+**And more importantly — the captions it picked were wrong in a predictable way.** The colour predictions tracked the *background*, not the clothing. Concrete failure: on a crop of someone wearing a **green shirt** with a piece of **purple gym equipment** behind them, the best-matching caption came out as *"A person wearing a purple plain coloured hoodie."* Wrong colour, wrong garment type — the caption was driven almost entirely by the background object. When we reviewed mispredictions one by one, the pattern was unambiguous: if the scene had a dominant coloured object, the caption's clothing colour biased toward it.
 
 We'd just rediscovered the reason CLIP wasn't good for our task in the first place. Using CLIP to caption a person was like asking a friend who can't tell left from right for directions — the same blind spot was going to corrupt everything downstream.
 
@@ -92,9 +92,9 @@ So we dropped the attribute-tree approach. The lesson: **a scene-biased model ca
 
 ## 4. Switching captioners and iterating the prompt
 
-Vision–language models like **DeepSeek-VL** were designed for subject-level captioning, not image-level similarity. That was the right kind of tool for the job. We switched.
+Vision–language models like **DeepSeek-VL2** were designed for subject-level captioning, not image-level similarity. That was the right kind of tool for the job. We switched.
 
-**Picking the right size mattered.** We evaluated the 7B variant (`deepseek-vl-7b-chat`) against the smaller 1.3B (`deepseek-vl-1.3b-chat`). The smaller model was faster and cheaper per image, but on complex prompts it struggled — captions became non-meaningful more often, and the failure rate on long attribute lists was noticeably higher. Since caption generation was already the rate-limiting step of the whole pipeline regardless of model size, paying the extra compute for the 7B model's reliability was the right trade.
+**Picking the right size mattered.** We evaluated the larger DeepSeek-VL2 variant against a smaller one — roughly 7B vs 1.3B parameters. The smaller model was faster and cheaper per image, but on complex prompts it struggled — captions became non-meaningful more often, and the failure rate on long attribute lists was noticeably higher. Since caption generation was already the rate-limiting step of the whole pipeline regardless of model size, paying the extra compute for the larger model's reliability was the right trade.
 
 A better tool doesn't automatically produce better captions, though. The first prompt we fed the VLM was naive, and the captions it produced had their own failure modes — truncation past CLIP's token budget, hallucinated attributes, activity descriptions drowning out identity cues. We needed to iterate the prompt, and we needed caption-level feedback that didn't require running a full pretraining pass every time we tried a new version.
 
@@ -175,7 +175,8 @@ Why the augmentation step matters: the VLM produced long, information-dense capt
 - **Initialisation:** off-the-shelf CLIP weights (no reason to throw away a strong starting point).
 - **Optimiser:** AdamW with β1 = 0.9, β2 = 0.98, ε = 1e-6, weight decay 0.1.
 - **Schedule:** cosine LR, base 1e-6, 2000-step warmup.
-- **Batch size:** 196, AMP mixed precision, 32 epochs.
+- **Batch size:** 196, AMP mixed precision.
+- **Epochs:** varied across experiments; typically in the low tens.
 - **Split:** 80 / 10 / 10 train / validation / test.
 
 ---
@@ -223,7 +224,7 @@ Each new product was a thin head on the frozen backbone:
 | Person attributes (colour, etc.) | small FC layers | classify clothing colour, other attributes |
 | Natural-language video search | dual index (person + scene) | retrieve frames by natural-language query |
 | Action / person-attribute | second-stage contrastive pretraining | extend embedding to encode actions |
-| Weapon detection | ViT-L/14 + adapters (static), then a temporal transformer on top | detect weapons in person crops; beats Gemini / DeepSeek-VL2 on F1 |
+| Weapon detection | ViT-L/14 action-person encoder + FC classifier (static), with a small temporal transformer added later | detect weapons in person crops; matches Gemini-level F1 and exceeds it on recall |
 
 The economics changed meaningfully. A new attribute head went from a multi-week dataset-plus-training project to a few days of fitting FC layers on top of a frozen embedding. A new retrieval product went from running a fresh contrastive pretraining to just indexing the existing embedding.
 
@@ -233,22 +234,38 @@ This is what foundation models are *supposed* to do for a product surface. The s
 
 ## 9. Extending to actions, then to weapons
 
-ReID and attributes covered the *who* and the *what they look like*. For safety-critical products we needed the *what they're doing*.
+ReID and attributes covered the *who* and the *what they look like*. For safety-critical products we needed the *what they're doing*. Gun detection became the flagship case — highest-stakes, most sensitive to false negatives, and the cleanest test of whether the foundation-model approach could earn its keep on a product that really matters.
 
-So we did a **second pretraining stage** — starting from the person backbone, adding action and interaction supervision on top. Same contrastive objective, captions extended with activity and object-interaction descriptions. The result is the action-person backbone that weapon detection sits on.
+### The gun-detection pipeline
 
-Weapon detection is where the whole stack had to prove itself. It's the highest-stakes downstream: false positives burn operator trust, missed detections cost safety. If the foundation-model approach was going to earn its keep on a product that matters, this was the test.
+The deployed gun detector isn't a single model; it's a **three-stage cascade**:
 
-### Step 1 — a static, single-frame weapon classifier
+1. **Primary detector** — a fast **YOLO** model running at the edge. Low-latency, moderate accuracy; it flags candidate regions in live video.
+2. **Secondary validator** — our cloud-side model (the subject of the rest of this section). More compute, richer representation, much higher accuracy. Think *"frontier-VLM-level accuracy, but proprietary and free at inference."*
+3. **Human in the loop** — positives from the secondary validator go to an operator for confirmation before an alert fires.
 
-Before we added any temporal reasoning, we built the minimum viable version: a **single-frame** classifier on top of the action-person embedding. The logic was simple — if a thin head on the foundation backbone couldn't beat strong VLM baselines on individual frames, temporal wasn't going to save us.
+The rest of this section is about stage 2 — the secondary validator. False positives from us burn operator trust; missed detections are the safety failure we can't afford.
 
-**Architecture.** A **ViT-L/14** vision encoder derived from the action-person foundation, with **adapter layers** inserted for parameter-efficient fine-tuning on the weapon-detection task. The main backbone stayed frozen; adapters and the classification head carried the task-specific capacity. Standard "small-tunable-capacity, large-frozen-backbone" pattern — consistent with the foundation-model reuse principle (§B3).
+### Why ViT-B/16 wasn't enough — the action-person foundation
+
+Our first gun-classifier experiments used the ViT-B/16 person-foundation backbone from §6 — the same backbone that worked well for ReID, person attributes, and natural-language video search. On those tasks, B/16 was sufficient.
+
+On gun detection it wasn't. The static classifier built on B/16 plateaued around **~64% accuracy** — nowhere near deployable for a safety-critical product. Gun detection needs a strictly richer representation than ReID does. Specifically, it needs the embedding to encode **person attributes and actions together** — *is this person in a pose consistent with holding a weapon-shaped object?* B/16's capacity couldn't carry that joint concept reliably.
+
+So we scaled up. We trained a **second-stage foundation on a ViT-L/14 backbone** — a full additional pretraining run starting from the person-foundation weights, on **combined captions**: some describing the person's appearance, some describing the action, some describing both together. This is what we refer to throughout the deck as the action-person foundation.
+
+With the action-person ViT-L/14 foundation underneath, the static gun classifier jumped to **~97%+ accuracy** on the same evaluation set — up from ~64% on B/16. Same pipeline, same training strategies; the only thing we changed was the backbone underneath. The capacity and task-alignment of the representation was the lever. This is one of the cleanest "the foundation matters" results we got — a 30+ percentage-point jump from getting the pretraining right.
+
+### The static, single-frame classifier
+
+The first production weapon classifier was single-frame. We did not plan to build a temporal model on top of it — the goal at the time was a strong per-frame detector, and that's what we focused on. Temporal showed up later, but we'll come to that.
+
+**Architecture.** The ViT-L/14 action-person encoder with a **classification head of fully-connected layers** on top of the encoder's output embedding. No exotic adapter architecture — plain FC head. The design variable that actually mattered was **how much of the backbone we co-trained with the head**, which we treated as a tunable: some runs kept the backbone fully frozen and only trained the FC head, some unfroze the last few transformer blocks, and some experiments unfroze the backbone entirely.
 
 **Training strategies that actually moved the needle:**
-- **Freezing schedule experiments.** Started with everything frozen except adapters and head. When adapter-only capacity bottlenecked, selectively unfroze the last few transformer blocks.
-- **Architecture experiments.** Adapter placement (every layer vs every other vs last-K blocks), bottleneck dimensions, head depth, with and without residual connections.
-- **Hyperparameter tuning.** Learning rate, adapter bottleneck size, regularisation strength, batch composition.
+- **Freezing schedule experiments.** Swept from fully-frozen-except-head, through top-down unfreezing of transformer blocks, to a fully-unfrozen backbone. The right answer depended on how much labelled data the run had — with enough data, partial unfreezing beat head-only.
+- **Architecture experiments.** FC head depth, hidden dimensions, with and without intermediate non-linearities.
+- **Hyperparameter tuning.** Learning rate, regularisation strength, batch composition.
 
 **Dataset strategies that mattered just as much:**
 - **Mixing ratios.** Weapon-positive crops are rare relative to negatives; naive training collapsed to "no weapon." Deliberate positive-to-negative ratios and loss weighting fixed that.
@@ -261,26 +278,33 @@ Before we added any temporal reasoning, we built the minimum viable version: a *
 Before committing to the custom stack, we compared it against the strongest off-the-shelf alternatives on the same secondary-validator task:
 - **Gemini** in two configurations — sequence-based (one call over a sequence of frames) and multi-vote (separate calls, majority).
 - **DeepSeek-VL2 Tiny** — a compact multimodal VLM.
-- **Ours** — action-person foundation + ViT-L/14 + adapters.
+- **Ours** — the action-person foundation (ViT-L/14) with an FC classifier on top.
 
 Evaluation ran on a held-out set covering both static crops and motion-extended crops (to capture motion context).
 
-**Headline result.** Our model had the **best F1 and the highest recall** of any approach tested. Gemini led on precision — it only said "weapon" when highly confident — but its recall lagged, which matters for a safety-critical detector where missed weapons are the dangerous failure mode. DeepSeek-VL2 sat between the two.
+**Headline result.** All three approaches clustered tightly on F1 (≈96–98%), but the precision / recall trade-offs were very different. Our model had the **highest F1 (~98.4%) and the highest recall (above 99%)**. Gemini ran precision-first — when it said "weapon," it was almost always right (precision ~99.5%) — but its recall sat around 97%. DeepSeek-VL2 Tiny sat in between.
 
 **F1 ordering:**
 
 ```
-   Ours   >   Gemini (voting)   >   DeepSeek-VL2 Tiny   >   Gemini (sequence)
+   Ours (~98.4%)  >  Gemini voting (~98.2%)  >  DeepSeek-VL2 Tiny (~98.3%)  >  Gemini sequence (~96%)
 ```
 
 The interpretation worth stating plainly:
-- General-purpose VLMs are genuinely strong. DeepSeek-VL2 and Gemini both hit F1 in the mid-to-high 90s zero-shot. That's not a trivial baseline.
-- On a narrow, high-stakes domain task, a **small custom head on the right foundation backbone** beats them — because the foundation already encodes the relevant semantics and the adapter just has to learn the decision boundary, not re-learn the visual concept.
-- This is the foundation-model investment paying off concretely: **beating frontier VLMs with a compact model trained on a domain-specific embedding.**
+- **General-purpose VLMs are genuinely strong.** DeepSeek-VL2 and Gemini both landed F1 around 96–98% zero-shot, with no task-specific training. That's not a trivial baseline — a frontier VLM doing surveillance weapon validation out of the box.
+- **But on a safety-critical detector, recall is what matters.** A missed weapon is the dangerous failure; a false positive is a confirmed non-issue by a human reviewer. Gemini's 97% recall means ~3 out of every 100 real weapons slip through; ours closes most of that gap.
+- **This is the foundation-model investment paying off concretely:** a small custom head on the right domain-specific embedding beats frontier VLMs on the metric that matters, because the foundation already encodes the relevant visual semantics and the head just learns the decision boundary.
 
-### Step 2 — adding temporal reasoning
+### Temporal — which we didn't plan to build
 
-Once the static model was strong, we added a temporal layer to resolve single-frame ambiguity. A phone, a tool, and a pistol can look similar at one angle and one moment. Persistence across frames disambiguates — if an object holds its shape relative to the hand across multiple frames, the signal is real; if it flickers in one frame and disappears, it probably isn't.
+Temporal reasoning wasn't on the roadmap. It came out of watching the static model's errors in deployment, where two failure classes kept showing up:
+
+- **False positives on non-gun objects** — phones, tools, pen-shaped items — that at a specific frame, angle, and pose looked gun-like. A person holding a phone near their hip, or a worker gripping a wrench at the wrong angle, could trigger the classifier.
+- **False negatives on real guns** — where pose, occlusion, or action made a real gun look non-gun-like for that single frame. Partial occlusion by clothing, hand orientation, motion blur, a gun drawn mid-motion.
+
+What both classes had in common: the *single-frame evidence was ambiguous*. Over a small number of subsequent frames, the ambiguity usually resolved — the phone moved out to reveal its phone shape, the wrench didn't hold a pistol pose across frames, the partially-occluded gun came into view a frame later. The object identity was stable; our evaluation window was too narrow.
+
+That observation — and only that observation — motivated the temporal layer. We put a small transformer (a few layers) on top of the per-frame embeddings produced by the static model — small, because the heavy visual work was already done by the static model's encoder; the temporal head only had to learn *"does this signal persist through pose, occlusion, and action changes, or does it disappear the moment conditions change?"*
 
 ```
   Frame t-2       Frame t-1         Frame t
@@ -295,7 +319,7 @@ Once the static model was strong, we added a temporal layer to resolve single-fr
                      ▼
           ┌─────────────────────┐
           │ Temporal transformer │
-          │  (2 layers, small)   │
+          │    (a few layers)    │
           └──────────┬───────────┘
                      ▼
                ┌───────────┐
@@ -303,13 +327,13 @@ Once the static model was strong, we added a temporal layer to resolve single-fr
                └───────────┘
 ```
 
-The temporal transformer operates on sequences of per-frame embeddings from the static model. Small — 2 layers — because the heavy visual work is already done by the frozen backbone; the temporal head just needs to learn "does this signal persist."
+Visually: the static model's encoder produces a per-frame embedding; the temporal transformer reads a small window of those embeddings and decides whether the weapon signal holds up across pose, occlusion, and motion changes.
 
-**Why a thin head still works:** because of round 4 (§4). The pretraining captions already mentioned carried objects, including weapons, so the embedding wasn't a blank slate — it had weapon-relevant semantics baked in from the pretraining corpus. The supervised head learns the decision boundary, not the visual concept.
+**Why a thin head works at all — for the static classifier and for the temporal layer on top of it:** because of round 4 (§4). The pretraining captions already mentioned carried objects, including weapons, so both models inherited an embedding with weapon-relevant semantics baked in. The supervised heads — static and temporal alike — learn decision boundaries; they don't have to re-learn the visual concept of "gun" from scratch.
 
 ### Deployment
 
-**Human-in-the-loop.** The classifier surfaces candidates; operators confirm. The model is designed to be a high-recall, reasonable-precision filter on a firehose, not an autonomous alarm. This shapes how we set thresholds and monitor drift.
+The classifier is explicitly designed as a **high-recall, reasonable-precision filter** — consistent with its position as stage 2 in the three-stage pipeline. The operator review step downstream handles the remaining precision cost; missing a real weapon at stage 2 is the failure mode we tune to avoid. This shapes how we set thresholds and monitor drift in production.
 
 Field validation runs across varied deployment conditions — distances, lighting regimes, motion patterns — with continuous production performance monitoring. Specifics of the performance envelope are internal.
 
@@ -319,14 +343,14 @@ Field validation runs across varied deployment conditions — distances, lightin
 
 Going in, we assumed the levers would be (a) more data, (b) bigger backbone, (c) more epochs.
 
-Ranked by measured contribution, what actually moved the needle:
+In practice — this is a **narrative ranking, not a formal ablation** — what seemed to move the needle most, in order:
 
-1. **Caption quality.** By a wide margin. Round-7 prompts produced roughly 2× more usable captions per image than round-1 — and the *quality* of those captions mattered more than the quantity. This was the single biggest lever.
-2. **Caption augmentation (sentence chunking).** Turned unusable verbose captions into several positives per image. Net ~1.7× effective training pairs.
+1. **Caption quality.** By a wide margin. The later prompt rounds produced notably more usable captions per image, and the *quality* of those captions mattered more than the raw count. This was the single biggest lever.
+2. **Caption augmentation (sentence chunking).** Turned long, verbose captions into several positives per image. Net ~1.7× effective training pairs.
 3. **Hyperparameter tuning.** The HP sweep alone lifted Market1501 Rank-1 from 0.258 → 0.439 — a bigger move than doubling the dataset would have been.
-4. **Backbone size.** In our regime, didn't matter nearly as much as 1–3.
+4. **Backbone size.** Mattered for specific downstream tasks — gun detection demanded ViT-L/14 over B/16 (§9) — but didn't move the base-foundation pretraining signal much once captions were right. The right framing isn't "bigger is always better" but "bigger when the task demands it."
 
-The lesson that stuck with us: **the bottleneck is rarely what the naive story says it is.** Caption alignment with the task was the bottleneck. Capacity, data volume, and training compute were all cheaper than they looked in hindsight, because they weren't the limiting factor.
+The lesson that stuck with us: **the bottleneck is rarely what the naive story says it is.** Caption alignment with the task was the bottleneck for the base foundation. For specific downstream tasks (gun detection), capacity was the bottleneck. Which one binds depends on the task — that's the meta-lesson.
 
 ### What I'd do differently if I ran this again
 
@@ -354,24 +378,27 @@ None of this invalidates what we did. We shipped a backbone that beats off-the-s
 
 ## 11. Where we're going next
 
-In rough order of expected impact to effort:
-
-**Surveillance-aware captioner.**
-Generic VLMs hallucinate on low-resolution crops. A captioner pretrained on surveillance imagery would fail gracefully instead of inventing attributes. Biggest remaining caption-quality lever.
+### What we've committed to
 
 **Hard-negative contrastive.**
-Current pretraining uses generic contrastive loss. Hard-negative mining — pairs of visually similar but different-identity crops — would sharpen the embedding in the confusable-identity region. Similar in spirit to metric learning in face recognition.
+Current pretraining uses generic contrastive loss. Hard-negative mining — pairs of visually similar but different-identity crops — would sharpen the embedding in the confusable-identity region, similar in spirit to metric learning in face recognition. This is the one direction I know we're taking up next.
+
+### Other directions I'd explore
+
+**Surveillance-aware captioner.**
+Generic VLMs hallucinate on low-resolution crops. A captioner pretrained on surveillance imagery would fail gracefully instead of inventing attributes. Biggest remaining caption-quality lever if we wanted to push that axis further.
 
 **Edge distillation.**
-Surveillance runs on bandwidth-constrained edge devices. ViT-B/16 is too heavy to deploy everywhere. Distilling to a smaller student (ViT-Tiny, MobileViT) would let the foundation-model wins reach production without a compute tax.
+Much of the deployed pipeline runs on bandwidth-constrained edge devices. Distilling the heavier backbones to smaller students (ViT-Tiny, MobileViT, or a task-specific custom student) would let the foundation-model wins reach the edge without a compute tax.
 
 **Cross-head consistency losses.**
-If the attributes head says "red shirt" and the ReID head says "same person as X," the two should be consistent with X's attributes. Adding a consistency loss couples the heads and forces the backbone to encode attributes more robustly.
+If the attributes head says "red shirt" and the ReID head says "same person as X," the two should be consistent with X's attributes. A consistency loss across heads would couple them and force the backbone to encode attributes more robustly.
 
-**What we're not doing:**
-- Bigger backbone — capacity isn't the bottleneck.
-- More public-web data — dilutes the surveillance-specific signal.
-- Replacing contrastive with masked-image modelling — MIM is good for dense prediction, weak for retrieval, and retrieval dominates our product surface.
+### Things I'd not do
+
+- **Bigger backbone for its own sake.** We did scale from B/16 to L/14 for action-person (§9) because the task demanded it. Beyond task-driven scaling, capacity isn't the bottleneck on the base foundation.
+- **More public-web data.** Dilutes the surveillance-specific signal.
+- **Replace contrastive with masked-image modelling.** MIM is good for dense prediction, weak for retrieval, and retrieval dominates our product surface.
 
 ---
 
@@ -380,17 +407,18 @@ If the attributes head says "red shirt" and the ReID head says "same person as X
 | | Off-the-shelf CLIP | Our person-centric model |
 |---|---|---|
 | Pretraining data | web-scale image–text pairs | person crops + VLM captions |
-| Captioner | N/A | VLM with 7-round tuned prompt |
+| Captioner | N/A | DeepSeek-VL2 with a 7-round tuned prompt |
 | Zero-shot ReID Rank-1 (Market1501) | 0.124 | **0.439** (3.5× gain) |
-| Downstream heads shipped | N/A | 5 (ReID, attrs, action, search, weapon) |
-| Per-product training cost | standalone | thin head on frozen backbone |
-| Weapon semantics in embedding | none | pre-seeded via captions |
+| Downstream products shipped | N/A | 5 (ReID, attrs, action, NL search, weapon detection) |
+| Per-product training cost | standalone model | lightweight head on a pretrained foundation |
+| Weapon semantics in embedding | none | pre-seeded via captions (round 4) |
+| Gun-detection accuracy on B/16 vs L/14 foundation | — | ~64% → ~97%+ |
 
 If there are three things to take away:
 
 1. **Off-the-shelf CLIP is scene-biased.** We fixed that by rewriting the *captions*, not the architecture.
-2. **One embedding powers five products.** The compounding value of foundation-model investment shows up at the second and third downstream, not the first.
-3. **Weapon detection was a thin head, not a new model.** That's what a working foundation looks like.
+2. **One foundation family powers five products.** The compounding value of foundation-model investment shows up at the second and third downstream, not the first — and the family includes both a B/16 backbone (ReID, attributes, NL search) and an L/14 action-person backbone (action, gun detection) because task demands differed.
+3. **Weapon detection was a classification head, not a new model.** Matches frontier-VLM F1, exceeds it on recall, proprietary, and free at inference. That's what a working foundation looks like downstream.
 
 ---
 
@@ -406,10 +434,12 @@ CLIP's original recipe was ViT. The pretrained OpenAI checkpoint is a strong ini
 
 ## Why freeze the backbone for downstream heads?
 
-Three reasons:
-- **Sample efficiency.** Supervised downstream datasets (weapon, attributes) are orders of magnitude smaller than the pretraining corpus. Fine-tuning the backbone on them overfits and destroys the foundation-model benefits.
+Three reasons it's the right *default*:
+- **Sample efficiency.** Supervised downstream datasets (weapon, attributes) are orders of magnitude smaller than the pretraining corpus. Fine-tuning the backbone on them risks overfitting and can destroy the foundation-model benefits.
 - **Consistency.** A frozen backbone means all heads share the *same* embedding. The attributes head and the ReID head agree about who a person is, because they're reading the same representation.
 - **Deployment simplicity.** One backbone checkpoint is served once; heads are cheap to hot-swap.
+
+**When we broke this default.** The static weapon classifier (§9) swept the full freezing-depth spectrum, including fully-unfrozen backbone runs. For high-stakes tasks where we had enough labelled data to tune safely and the marginal gain from unfreezing outweighed the consistency / overfitting costs, partial or full unfreezing was the right call. "Freeze by default" is a principle; "always freeze" is a rule we explicitly didn't follow.
 
 ## Why zero-shot as the validation signal?
 
@@ -426,9 +456,9 @@ VLM captions were long — one image, one 200-token caption. Directly tokenising
 
 ## How does this connect to other work I've done?
 
-A connecting thread: in both the EEN foundation model work and a recent small-data classification project I did, the "obvious big model" lost to a domain-aligned choice, and the validation discipline was the same — cheap representation probe first, scale only if signal shows up. That's become a pattern I trust:
+A connecting thread: in both this foundation-model work and a recent small-data classification project, the "obvious big model" lost to a domain-aligned choice, and the validation discipline was the same — cheap representation probe first, scale only if signal shows up. That's become a pattern I trust:
 
-| | Small-data classifier project | EEN person foundation model |
+| | Small-data classifier project | Person foundation model |
 |---|---|---|
 | "Obvious big model" tried | generic time-series foundation model | off-the-shelf CLIP |
 | Why it lost | domain + task mismatch | scene-biased captions |
@@ -453,13 +483,14 @@ Different scales, same instincts: **measure what the representation is actually 
 | 7 | Training the backbone (§6) | pretraining pipeline diagram |
 | 8 | First real signal (§7) | Market1501 Rank-1 bar chart |
 | 9 | One model, five products (§8) | hub-and-spoke |
-| 10 | Action extension + static gun classifier (§9, step 1) | ViT-L/14 + adapter architecture |
-| 11 | Benchmark vs Gemini and DeepSeek-VL2 (§9) | F1 ordering bar chart |
-| 12 | Temporal gun model + deployment (§9, step 2) | temporal transformer diagram |
-| 13 | What actually moved the needle (§10) | ranked-factors table |
-| 14 | Where we go next (§11) | effort-vs-impact quadrant |
-| 15 | Short version (§12) | comparison table + 3 lines |
-| 16 | Backup | — |
+| 10 | Gun-detection pipeline + why B/16 wasn't enough (§9) | 3-stage cascade diagram + B/16 vs L/14 accuracy bar |
+| 11 | Static classifier — architecture + training/dataset strategies (§9) | ViT-L/14 + FC head + freezing-depth sweep |
+| 12 | Benchmark vs Gemini and DeepSeek-VL2 (§9) | F1 / recall bar chart |
+| 13 | Temporal extension, driven by observed failures (§9) | failure-mode examples + temporal transformer diagram |
+| 14 | What actually moved the needle (§10) | ranked-factors table |
+| 15 | Where we go next (§11) | hard-negative committed + other directions |
+| 16 | Short version (§12) | comparison table + 3 takeaways |
+| 17 | Backup | — |
 
 ---
 
@@ -473,4 +504,4 @@ Different scales, same instincts: **measure what the representation is actually 
 - **Deployment specifics** — inference serving infra, sampling configurations, threshold and drift-monitoring parameters.
 - **Internal identifiers** — internal model code-names, colleagues' names, Jira IDs, runbook and monitoring URLs.
 
-If the audience for this deck is fully internal to EEN, the first two bullets can be relaxed — tell me and I'll add the source-per-dataset counts, aggregate corpus size, and caption-generation time numbers from the Confluence source page.
+If the audience for this deck is fully internal to the team that built it, the first two bullets can be relaxed — the source-per-dataset counts, aggregate corpus size, and caption-generation throughput numbers from the internal source docs can be added in that case.
